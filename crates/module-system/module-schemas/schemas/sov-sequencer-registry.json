@@ -124,6 +124,41 @@
         }
       },
       "additionalProperties": false
+    },
+    {
+      "description": "Rotates the sequencer's DA address without unstaking.\n\nAuthorized by the rollup key (`context.sender()`) — the intended recovery path when a DA signing key is compromised but the rollup key is safe. Preserves `balance`, `balance_state`, and the `preferred_sequencer` pointer (atomically moved to `new_da_address` if the caller was the preferred sequencer).\n\nAfter this call lands on-chain, the sequencer node operator must restart their binary with the new DA signer keys. The registry cannot enforce this from state.",
+      "type": "object",
+      "required": [
+        "update_da_address"
+      ],
+      "properties": {
+        "update_da_address": {
+          "type": "object",
+          "required": [
+            "new_da_address",
+            "old_da_address"
+          ],
+          "properties": {
+            "new_da_address": {
+              "description": "The new DA address. Must not already be registered.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MockAddress"
+                }
+              ]
+            },
+            "old_da_address": {
+              "description": "The sequencer's current DA address (the one being rotated away from).",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MockAddress"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": false
     }
   ],
   "definitions": {

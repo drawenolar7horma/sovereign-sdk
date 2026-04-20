@@ -169,6 +169,10 @@ pub enum CustomError<RollupAddress: BasicAddress, DaAddress: BasicAddress> {
         /// The address of the transaction sender.
         sender: RollupAddress,
     },
+
+    /// The sequencer attempted to update its DA address to the same value.
+    #[error("Cannot update DA address to the same value: {0}")]
+    NewDaAddressSameAsOld(DaAddress),
 }
 
 /// The different errors that can be raised by the sequencer registry
@@ -222,6 +226,11 @@ impl<S: Spec> Module for SequencerRegistry<S> {
             CallMessage::Withdraw { da_address } => {
                 Ok(self.withdraw(&da_address, context, state)?)
             }
+
+            CallMessage::UpdateDaAddress {
+                old_da_address,
+                new_da_address,
+            } => Ok(self.update_da_address(&old_da_address, &new_da_address, context, state)?),
         }
     }
 }

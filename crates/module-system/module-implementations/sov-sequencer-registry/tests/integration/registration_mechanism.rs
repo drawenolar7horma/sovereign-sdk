@@ -777,6 +777,736 @@ fn test_non_registered_sequencer_cannot_send_batches() {
     assert!(outcome.batch_receipts.is_empty());
 }
 
+const ROTATED_DA_ADDRESS: [u8; 32] = [3; 32];
+const SECOND_ROTATED_DA_ADDRESS: [u8; 32] = [4; 32];
+
+/// A1 + C1: happy path. A regular sequencer rotates its DA from inside a different
+/// sequencer's batch (to bypass the own-batch guard). Verifies that:
+/// - the old entry is gone,
+/// - the new entry preserves rollup address, balance, and Active state,
+/// - the `DaAddressUpdated` event is emitted with matching fields,
+/// - the preferred_sequencer pointer is untouched (additional_sequencer is not preferred).
+#[test]
+fn test_update_da_address_happy_path() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let rollup_address = additional_sequencer.address();
+    let old_da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let new_da: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: old_da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+
+    // Genesis default_sequencer is still the active batch producer, so the
+    // additional_sequencer is not in its own batch. Own-batch guard does not fire.
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: old_da,
+                new_da_address: new_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            assert!(result.tx_receipt.is_successful());
+
+            assert!(
+                TestSequencerRegistry::default()
+                    .is_sender_known(&old_da, state)
+                    .is_err(),
+                "Old DA entry should be gone after rotation"
+            );
+
+            let new_entry = TestSequencerRegistry::default()
+                .is_sender_known(&new_da, state)
+                .expect("New DA entry should exist after rotation");
+            assert_eq!(new_entry.address, rollup_address);
+            assert_eq!(new_entry.balance, SEQUENCE_STAKE);
+            assert!(new_entry.balance_state.is_active());
+
+            assert!(
+                result.events.iter().any(|event| matches!(
+                    event,
+                    TestRuntimeEvent::SequencerRegistry(
+                        sov_sequencer_registry::Event::DaAddressUpdated {
+                            sequencer,
+                            old_da_address,
+                            new_da_address,
+                        }
+                    ) if *sequencer == rollup_address
+                        && *old_da_address == old_da
+                        && *new_da_address == new_da
+                )),
+                "DaAddressUpdated event with matching fields should be emitted"
+            );
+        }),
+    });
+}
+
+/// A2 + A3: impersonation is blocked. A and B are both registered sequencers;
+/// A's rollup key signs a tx carrying B's DA address as `old_da_address`.
+/// Expected: `SuppliedAddressDoesNotMatchTxSender`, and neither sequencer's
+/// registry entry is mutated.
+#[test]
+fn test_update_da_address_cannot_hijack_victim_da() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            admin: victim,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let attacker_rollup = additional_sequencer.address();
+    let victim_rollup = victim.address();
+    let attacker_da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let victim_da: MockAddress = ANOTHER_SEQUENCER_DA_ADDRESS.into();
+    let malicious_new_da: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: attacker_da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+    runner.execute(victim.create_plain_message::<RT, TestSequencerRegistry>(
+        CallMessage::Register {
+            da_address: victim_da,
+            amount: SEQUENCE_STAKE,
+        },
+    ));
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: victim_da,
+                new_da_address: malicious_new_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            match &result.tx_receipt {
+                TxEffect::Reverted(reason) => {
+                    assert_eq!(
+                        reason.reason.to_string(),
+                        TestSequencerRegistryError::Custom(
+                            CustomError::SuppliedAddressDoesNotMatchTxSender {
+                                parameter: victim_rollup,
+                                sender: attacker_rollup,
+                            },
+                        )
+                        .to_string(),
+                    );
+                }
+                unexpected => panic!("Expected revert, got: {unexpected:?}"),
+            }
+
+            let attacker_entry = TestSequencerRegistry::default()
+                .is_sender_known(&attacker_da, state)
+                .expect("Attacker entry must be intact");
+            assert_eq!(attacker_entry.address, attacker_rollup);
+
+            let victim_entry = TestSequencerRegistry::default()
+                .is_sender_known(&victim_da, state)
+                .expect("Victim entry must be intact");
+            assert_eq!(victim_entry.address, victim_rollup);
+
+            assert!(
+                TestSequencerRegistry::default()
+                    .is_sender_known(&malicious_new_da, state)
+                    .is_err(),
+                "Malicious new DA must not have been inserted"
+            );
+        }),
+    });
+}
+
+/// B1: rotating from a DA the caller doesn't own (and that isn't registered at all)
+/// fails with `IsNotRegistered`, produced by `validate_sender`.
+#[test]
+fn test_update_da_address_old_not_registered_fails() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let phantom_old_da: MockAddress = ROTATED_DA_ADDRESS.into();
+    let new_da: MockAddress = SECOND_ROTATED_DA_ADDRESS.into();
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: phantom_old_da,
+                new_da_address: new_da,
+            },
+        ),
+        assert: Box::new(move |result, _state| match &result.tx_receipt {
+            TxEffect::Reverted(reason) => {
+                assert_eq!(
+                    reason.reason.to_string(),
+                    TestSequencerRegistryError::IsNotRegistered(phantom_old_da).to_string(),
+                );
+            }
+            unexpected => panic!("Expected revert, got: {unexpected:?}"),
+        }),
+    });
+}
+
+/// B2: rotating to the same address the sequencer already uses fails with
+/// `NewDaAddressSameAsOld`.
+#[test]
+fn test_update_da_address_same_old_new_fails() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: da,
+                new_da_address: da,
+            },
+        ),
+        assert: Box::new(move |result, _state| match &result.tx_receipt {
+            TxEffect::Reverted(reason) => {
+                assert_eq!(
+                    reason.reason.to_string(),
+                    TestSequencerRegistryError::Custom(CustomError::NewDaAddressSameAsOld(da))
+                        .to_string(),
+                );
+            }
+            unexpected => panic!("Expected revert, got: {unexpected:?}"),
+        }),
+    });
+}
+
+/// B3: rotating onto another sequencer's DA fails with `AlreadyRegistered`,
+/// carrying the conflicting rollup address. Verifies no state mutation occurs.
+#[test]
+fn test_update_da_address_new_already_registered_fails() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            admin: other,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let attacker_rollup = additional_sequencer.address();
+    let other_rollup = other.address();
+    let attacker_da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let other_da: MockAddress = ANOTHER_SEQUENCER_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: attacker_da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+    runner.execute(other.create_plain_message::<RT, TestSequencerRegistry>(
+        CallMessage::Register {
+            da_address: other_da,
+            amount: SEQUENCE_STAKE,
+        },
+    ));
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: attacker_da,
+                new_da_address: other_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            match &result.tx_receipt {
+                TxEffect::Reverted(reason) => {
+                    assert_eq!(
+                        reason.reason.to_string(),
+                        TestSequencerRegistryError::AlreadyRegistered(other_rollup).to_string(),
+                    );
+                }
+                unexpected => panic!("Expected revert, got: {unexpected:?}"),
+            }
+
+            assert_eq!(
+                TestSequencerRegistry::default()
+                    .is_sender_known(&attacker_da, state)
+                    .unwrap()
+                    .address,
+                attacker_rollup,
+            );
+            assert_eq!(
+                TestSequencerRegistry::default()
+                    .is_sender_known(&other_da, state)
+                    .unwrap()
+                    .address,
+                other_rollup,
+            );
+        }),
+    });
+}
+
+/// B4: multi-DA is currently permitted by `register_staker` (it only rejects
+/// duplicate DA keys, not duplicate rollup addresses). If a single rollup
+/// registers two DAs, rotating one onto the other must fail with
+/// `AlreadyRegistered` carrying the caller's own rollup address. Documents
+/// current multi-DA semantics.
+#[test]
+fn test_update_da_address_new_same_as_caller_other_da_fails() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let rollup = additional_sequencer.address();
+    let da_one: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let da_two: MockAddress = ANOTHER_SEQUENCER_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: da_one,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: da_two,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: da_one,
+                new_da_address: da_two,
+            },
+        ),
+        assert: Box::new(move |result, _state| match &result.tx_receipt {
+            TxEffect::Reverted(reason) => {
+                assert_eq!(
+                    reason.reason.to_string(),
+                    TestSequencerRegistryError::AlreadyRegistered(rollup).to_string(),
+                );
+            }
+            unexpected => panic!("Expected revert, got: {unexpected:?}"),
+        }),
+    });
+}
+
+/// C2: rotating a sequencer in `PendingWithdrawal { ready_at }` must preserve
+/// the state exactly, including `ready_at`. F1 composes with this: after
+/// advancing past `ready_at`, `Withdraw` on the new DA succeeds.
+#[test]
+fn test_update_da_address_preserves_pending_withdrawal_state() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let rollup = additional_sequencer.address();
+    let old_da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let new_da: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: old_da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::InitiateWithdrawal { da_address: old_da },
+        ),
+    );
+
+    // Capture the exact `ready_at` that was written by InitiateWithdrawal.
+    let pre_rotation_ready_at = runner.query_visible_state(|state| {
+        let entry = TestSequencerRegistry::default()
+            .is_sender_known(&old_da, state)
+            .unwrap();
+        match entry.balance_state {
+            sov_sequencer_registry::BalanceState::PendingWithdrawal { ready_at } => ready_at,
+            other => panic!("Expected PendingWithdrawal, got {other:?}"),
+        }
+    });
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: old_da,
+                new_da_address: new_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            assert!(result.tx_receipt.is_successful());
+
+            let new_entry = TestSequencerRegistry::default()
+                .is_sender_known(&new_da, state)
+                .expect("New DA entry should exist after rotation");
+            assert_eq!(new_entry.address, rollup);
+            assert_eq!(new_entry.balance, SEQUENCE_STAKE);
+            match new_entry.balance_state {
+                sov_sequencer_registry::BalanceState::PendingWithdrawal { ready_at } => {
+                    assert_eq!(ready_at, pre_rotation_ready_at);
+                }
+                other => panic!("Expected PendingWithdrawal preserved, got {other:?}"),
+            }
+        }),
+    });
+
+    // F1: Withdraw on new DA completes normally once `ready_at` is reached.
+    runner.advance_slots(config_value!("DEFERRED_SLOTS_COUNT") + 1);
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Withdraw { da_address: new_da },
+        ),
+        assert: Box::new(move |result, state| {
+            assert!(result.tx_receipt.is_successful());
+            assert!(
+                TestSequencerRegistry::default()
+                    .is_sender_known(&new_da, state)
+                    .is_err(),
+                "After Withdraw, new DA entry should be gone"
+            );
+            assert!(result.events.iter().any(|event| matches!(
+                event,
+                TestRuntimeEvent::SequencerRegistry(
+                    sov_sequencer_registry::Event::Withdrew { sequencer, amount_withdrawn }
+                ) if *sequencer == rollup && *amount_withdrawn == SEQUENCE_STAKE
+            )));
+        }),
+    });
+}
+
+/// D1 + G1: rotating the preferred sequencer's DA moves the `preferred_sequencer`
+/// pointer so that `get_preferred_sequencer` returns the new DA — which is
+/// what `blob-storage::separate_preferred_blobs` reads.
+#[test]
+fn test_update_da_address_moves_preferred_sequencer() {
+    let (
+        TestRoles {
+            default_sequencer,
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let preferred_rollup = default_sequencer.user_info.address();
+    let old_preferred_da = default_sequencer.da_address;
+    let new_preferred_da: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    // Register `additional_sequencer` and make them the active batch producer
+    // so the preferred sequencer isn't executing their own batch when they rotate.
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: ANOTHER_SEQUENCER_DA_ADDRESS.into(),
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+    runner.config.sequencer_da_address = ANOTHER_SEQUENCER_DA_ADDRESS.into();
+
+    runner.execute_transaction(TransactionTestCase {
+        input: default_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: old_preferred_da,
+                new_da_address: new_preferred_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            assert!(result.tx_receipt.is_successful());
+
+            assert_eq!(
+                TestSequencerRegistry::default()
+                    .get_preferred_sequencer(state)
+                    .unwrap_infallible(),
+                Some((new_preferred_da, preferred_rollup)),
+            );
+
+            assert!(
+                TestSequencerRegistry::default()
+                    .is_sender_known(&old_preferred_da, state)
+                    .is_err(),
+                "Old preferred DA should be removed from known_sequencers"
+            );
+        }),
+    });
+}
+
+/// D2: rotating a regular (non-preferred) sequencer must not touch the
+/// `preferred_sequencer` pointer.
+#[test]
+fn test_update_da_address_regular_rotation_does_not_touch_preferred() {
+    let (
+        TestRoles {
+            default_sequencer,
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let preferred_rollup = default_sequencer.user_info.address();
+    let preferred_da = default_sequencer.da_address;
+    let regular_old_da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let regular_new_da: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: regular_old_da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: regular_old_da,
+                new_da_address: regular_new_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            assert!(result.tx_receipt.is_successful());
+
+            assert_eq!(
+                TestSequencerRegistry::default()
+                    .get_preferred_sequencer(state)
+                    .unwrap_infallible(),
+                Some((preferred_da, preferred_rollup)),
+                "Preferred sequencer pointer must be untouched when rotating a regular sequencer",
+            );
+        }),
+    });
+}
+
+/// E1: the preferred/active batch producer cannot rotate its own DA mid-batch.
+/// Same rationale as `CannotUnregisterDuringOwnBatch` on `InitiateWithdrawal`.
+#[test]
+fn test_update_da_address_during_own_batch_fails() {
+    let (
+        TestRoles {
+            default_sequencer, ..
+        },
+        mut runner,
+    ) = setup();
+
+    let old_da = default_sequencer.da_address;
+    let new_da: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    runner.execute_transaction(TransactionTestCase {
+        input: default_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: old_da,
+                new_da_address: new_da,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            match &result.tx_receipt {
+                TxEffect::Reverted(reason) => {
+                    assert_eq!(
+                        reason.reason.to_string(),
+                        TestSequencerRegistryError::Custom(
+                            CustomError::CannotUnregisterDuringOwnBatch(old_da),
+                        )
+                        .to_string(),
+                    );
+                }
+                unexpected => panic!("Expected revert, got: {unexpected:?}"),
+            }
+
+            // State must remain unchanged: old DA still present, new DA absent.
+            assert!(TestSequencerRegistry::default()
+                .is_sender_known(&old_da, state)
+                .is_ok());
+            assert!(TestSequencerRegistry::default()
+                .is_sender_known(&new_da, state)
+                .is_err());
+        }),
+    });
+}
+
+/// F3 + F4 + G2: after rotation, `Deposit` on the new DA succeeds (balance
+/// increases as expected) and on the old DA fails (`IsNotRegistered`).
+#[test]
+fn test_deposit_after_da_rotation() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let rollup = additional_sequencer.address();
+    let old_da: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let new_da: MockAddress = ROTATED_DA_ADDRESS.into();
+    let deposit_amount = Amount::new(1234);
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: old_da,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: old_da,
+                new_da_address: new_da,
+            },
+        ),
+    );
+
+    // F3: Deposit on new DA succeeds and balance increases.
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Deposit {
+                da_address: new_da,
+                amount: deposit_amount,
+            },
+        ),
+        assert: Box::new(move |result, state| {
+            assert!(result.tx_receipt.is_successful());
+            let entry = TestSequencerRegistry::default()
+                .is_sender_known(&new_da, state)
+                .unwrap();
+            assert_eq!(entry.address, rollup);
+            assert_eq!(
+                entry.balance,
+                SEQUENCE_STAKE.checked_add(deposit_amount).unwrap()
+            );
+        }),
+    });
+
+    // F4: Deposit on old DA fails.
+    runner.execute_transaction(TransactionTestCase {
+        input: additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Deposit {
+                da_address: old_da,
+                amount: deposit_amount,
+            },
+        ),
+        assert: Box::new(move |result, _state| match &result.tx_receipt {
+            TxEffect::Reverted(reason) => {
+                assert_eq!(
+                    reason.reason.to_string(),
+                    TestSequencerRegistryError::IsNotRegistered(old_da).to_string(),
+                );
+            }
+            unexpected => panic!("Expected revert, got: {unexpected:?}"),
+        }),
+    });
+}
+
+/// F5 + F6 + I1: chain rotations A → B → C → A. Verifies the registry entry
+/// hops correctly through each DA, balance + rollup address are preserved
+/// across all hops, and the final state contains exactly one entry for this
+/// sequencer (at the original DA).
+#[test]
+fn test_multiple_rotations_and_rotate_back() {
+    let (
+        TestRoles {
+            additional_sequencer,
+            ..
+        },
+        mut runner,
+    ) = setup();
+
+    let rollup = additional_sequencer.address();
+    let da_a: MockAddress = NON_DEFAULT_SEQUENCER_DA_ADDRESS.into();
+    let da_b: MockAddress = ANOTHER_SEQUENCER_DA_ADDRESS.into();
+    let da_c: MockAddress = ROTATED_DA_ADDRESS.into();
+
+    runner.execute(
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::Register {
+                da_address: da_a,
+                amount: SEQUENCE_STAKE,
+            },
+        ),
+    );
+
+    let rotate = |from: MockAddress, to: MockAddress| {
+        additional_sequencer.create_plain_message::<RT, TestSequencerRegistry>(
+            CallMessage::UpdateDaAddress {
+                old_da_address: from,
+                new_da_address: to,
+            },
+        )
+    };
+
+    runner.execute(rotate(da_a, da_b));
+    runner.execute(rotate(da_b, da_c));
+    runner.execute(rotate(da_c, da_a));
+
+    runner.query_visible_state(|state| {
+        let reg = TestSequencerRegistry::default();
+
+        let entry_a = reg
+            .is_sender_known(&da_a, state)
+            .expect("After rotating back, entry must live at DA A");
+        assert_eq!(entry_a.address, rollup);
+        assert_eq!(entry_a.balance, SEQUENCE_STAKE);
+        assert!(entry_a.balance_state.is_active());
+
+        assert!(reg.is_sender_known(&da_b, state).is_err());
+        assert!(reg.is_sender_known(&da_c, state).is_err());
+    });
+}
+
 /// We should not be able to increase the stake amount (through deposit) for a non-registered sequencer.
 #[test]
 fn test_balance_increase_fails_for_unknown_sequencer() {

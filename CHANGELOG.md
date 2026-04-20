@@ -1,3 +1,6 @@
+# 2026-04-20
+- #PR_NUMBER sov-sequencer-registry: Add `UpdateDaAddress` call message that rotates a registered sequencer's DA address without unstaking. Authorized by the rollup key (`context.sender()`), so a sequencer whose DA signing key is compromised (but whose rollup key is safe) can recover without going through withdrawal. Balance, balance state, and preferred-sequencer pointer are preserved. Operators must restart their node with the new DA signer after the rotation lands.
+
 # 2026-04-16
 - #2746 Removes re-export of `DaSyncState` and `SyncStatus` from sov-modules-api. Please use `sov-rollup-interface` directly
 - #2744 **Manual intervention might be needed**: Adds `serde(deny_unknown_fields)`, which can fail rollup at startup if genesis config is not tidy.

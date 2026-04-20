@@ -45,6 +45,23 @@ pub enum CallMessage<S: Spec> {
         /// The DA address of the sequencer you're removing.
         da_address: <S::Da as DaSpec>::Address,
     },
+    /// Rotates the sequencer's DA address without unstaking.
+    ///
+    /// Authorized by the rollup key (`context.sender()`) — the intended
+    /// recovery path when a DA signing key is compromised but the rollup
+    /// key is safe. Preserves `balance`, `balance_state`, and the
+    /// `preferred_sequencer` pointer (atomically moved to `new_da_address`
+    /// if the caller was the preferred sequencer).
+    ///
+    /// After this call lands on-chain, the sequencer node operator must
+    /// restart their binary with the new DA signer keys. The registry
+    /// cannot enforce this from state.
+    UpdateDaAddress {
+        /// The sequencer's current DA address (the one being rotated away from).
+        old_da_address: <S::Da as DaSpec>::Address,
+        /// The new DA address. Must not already be registered.
+        new_da_address: <S::Da as DaSpec>::Address,
+    },
 }
 
 impl<S: Spec> SequencerRegistry<S> {
@@ -267,6 +284,76 @@ impl<S: Spec> SequencerRegistry<S> {
             },
         );
 
+        Ok(())
+    }
+
+    /// Rotates a sequencer's DA address while preserving their stake and state.
+    ///
+    /// Authorized by the caller's rollup key: `validate_sender` checks that
+    /// `context.sender()` matches the rollup address stored under `old_da_address`,
+    /// which blocks impersonation of another sequencer's DA.
+    ///
+    /// # Errors
+    /// - If `old_da_address` is not registered.
+    /// - If the caller's rollup key does not own the entry at `old_da_address`.
+    /// - If `new_da_address` equals `old_da_address`.
+    /// - If `new_da_address` is already registered.
+    /// - TODO: Address this some-how: End Batch Hook, or something like it.
+    ///   If the caller is the active batch producer for this slot
+    ///   (`CannotUnregisterDuringOwnBatch`): `blob-storage` reads
+    ///   `preferred_sequencer` / `known_sequencers` live during slot processing,
+    ///   so flipping them mid-own-batch creates intra-slot inconsistency.
+    ///
+    pub(crate) fn update_da_address<ST: TxState<S>>(
+        &mut self,
+        old_da_address: &<S::Da as DaSpec>::Address,
+        new_da_address: &<S::Da as DaSpec>::Address,
+        context: &Context<S>,
+        state: &mut ST,
+    ) -> Result<(), SequencerRegistryError<S, ST>> {
+        self.validate_sender(old_da_address, context.sender(), state)?;
+
+        if old_da_address == new_da_address {
+            return Err(RegistrationError::Custom(
+                CustomError::NewDaAddressSameAsOld(*old_da_address),
+            ));
+        }
+
+        if let Some(conflict) = self.known_sequencers.get(new_da_address, state)? {
+            return Err(RegistrationError::AlreadyRegistered(conflict.address));
+        }
+
+        let existing_sequencer = self
+            .known_sequencers
+            .get(old_da_address, state)?
+            .expect("validate_sender guarantees old_da_address is registered");
+
+        if &existing_sequencer.address == context.sequencer() {
+            return Err(RegistrationError::Custom(
+                CustomError::CannotUnregisterDuringOwnBatch(*old_da_address),
+            ));
+        }
+
+        let rollup_address = existing_sequencer.address;
+
+        self.known_sequencers.delete(old_da_address, state)?;
+        self.known_sequencers
+            .set(new_da_address, &existing_sequencer, state)?;
+
+        if let Some(preferred) = self.preferred_sequencer.get(state)? {
+            if &preferred == old_da_address {
+                self.preferred_sequencer.set(new_da_address, state)?;
+            }
+        }
+
+        self.emit_event(
+            state,
+            Event::<S>::DaAddressUpdated {
+                sequencer: rollup_address,
+                old_da_address: *old_da_address,
+                new_da_address: *new_da_address,
+            },
+        );
         Ok(())
     }
 
