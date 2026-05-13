@@ -100,7 +100,7 @@ where
 }
 
 /// Runs the v1 migration and writes the JSON report to stdout.
-pub fn run<S, H, Da>(
+pub fn run<S, H>(
     args: crate::MigrationArgs,
     accounts: &mut Accounts<S>,
     chain_state: &mut ChainState<S>,
@@ -111,15 +111,12 @@ where
             OutputSize = sov_rollup_interface::reexports::digest::typenum::U32,
         > + Send
         + Sync,
-    Da: sov_rollup_interface::node::da::DaService<Spec = S::Da>,
-    sov_stf_runner::RollupConfig<S::Address, Da>: serde::de::DeserializeOwned,
     S::Storage: sov_db::storage_manager::InitializableNativeNomtStorage<
             H,
             <S::Da as sov_rollup_interface::da::DaSpec>::SlotHash,
         > + crate::MigrationStorage,
 {
-    let storage =
-        crate::load_storage_config::<S, Da>(&args.rollup_config_path, args.db_path.as_deref())?;
+    let storage = crate::load_storage_config(&args.rollup_config_path, args.db_path.as_deref())?;
     let report = run_with_options::<S, H>(
         crate::MigrationOptions {
             storage,
@@ -215,9 +212,7 @@ where
         )?;
         if post_head_slot_number != head_slot_number {
             anyhow::bail!(
-                "post-migration head slot changed unexpectedly: expected {}, found {}",
-                head_slot_number,
-                post_head_slot_number
+                "post-migration head slot changed unexpectedly: expected {head_slot_number}, found {post_head_slot_number}"
             );
         }
         crate::assert_ledger_head_state_root_matches_storage_root(
